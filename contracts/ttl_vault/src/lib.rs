@@ -8,7 +8,7 @@ use soroban_sdk::{
 mod types;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
-    PasskeyHash, BackupCode, WithdrawalRequest, DepositProof,
+    PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -16,7 +16,9 @@ use types::{
     VAULT_CREATED_TOPIC, WITHDRAW_TOPIC, MAX_METADATA_LEN, MAX_NAME_LEN, MAX_DESCRIPTION_LEN,
     MAX_NOTES_LEN, MAX_CUSTOM_METADATA_LEN, PAUSE_VAULT_TOPIC, RESUME_VAULT_TOPIC, SET_METADATA_TOPIC,
     INHERITANCE_TOPIC, ADD_PASSKEY_TOPIC, REMOVE_PASSKEY_TOPIC, ROTATE_PASSKEY_TOPIC,
-    BACKUP_CODE_USED_TOPIC, BACKUP_CODES_GENERATED_TOPIC,
+    BACKUP_CODE_USED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, DELEGATE_BENEFICIARY_TOPIC,
+    DISPUTE_FILED_TOPIC, DISPUTE_RESOLVED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_EXECUTED_TOPIC,
+    CONDITIONS_ACCEPTED_TOPIC,
 };
 
 #[cfg(test)]
@@ -88,9 +90,10 @@ pub enum ContractError {
     PasskeyNotFound = 27,
     InvalidBackupCode = 28,
     BackupCodeAlreadyUsed = 29,
-    DepositLimitExceeded = 30,
-    WithdrawalNotApproved = 31,
-    InvalidProof = 32,
+    NotBeneficiary = 30,
+    DisputeFiled = 31,
+    NoScheduledWithdrawals = 32,
+    ConditionsNotApproved = 33,
 }
 
 #[contract]
@@ -3372,289 +3375,276 @@ impl TtlVaultContract {
         false
     }
 
-    // --- Issue #403: Deposit Limits ---
+    // --- Issue #401: Beneficiary Delegation ---
 
-    /// Sets the maximum deposit amount for a vault.
-    ///
-    /// Only the vault owner can call this function.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    /// * `limit` - Maximum deposit amount in stroops (None to remove limit)
-    /// * `caller` - The address of the caller (must be the vault owner)
-    ///
-    /// # Panics
-    /// * Panics if the caller is not the vault owner
-    /// * Panics if the vault is not found
-    pub fn set_max_deposit(env: Env, vault_id: u64, caller: Address, limit: Option<i128>) {
-        caller.require_auth();
-        let mut vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            panic_with_error!(&env, ContractError::NotOwner);
-        }
-        vault.max_deposit_amount = limit;
-        Self::save_vault(&env, vault_id, &vault);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-    }
-
-    /// Gets the maximum deposit amount for a vault.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    ///
-    /// # Returns
-    /// `Some(limit)` if a limit is set, `None` otherwise
-    pub fn get_max_deposit(env: Env, vault_id: u64) -> Option<i128> {
-        if let Some(vault) = Self::try_load_vault(&env, vault_id) {
-            vault.max_deposit_amount
-        } else {
-            None
-        }
-    }
-
-    // --- Issue #404: Withdrawal Approval Flow ---
-
-    /// Sets the withdrawal approval threshold for a vault.
-    ///
-    /// Only the vault owner can call this function.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    /// * `caller` - The address of the caller (must be the vault owner)
-    /// * `threshold` - Withdrawals above this amount require beneficiary approval (None to disable)
-    ///
-    /// # Panics
-    /// * Panics if the caller is not the vault owner
-    /// * Panics if the vault is not found
-    pub fn set_withdrawal_approval_threshold(env: Env, vault_id: u64, caller: Address, threshold: Option<i128>) {
-        caller.require_auth();
-        let mut vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            panic_with_error!(&env, ContractError::NotOwner);
-        }
-        vault.withdrawal_approval_threshold = threshold;
-        Self::save_vault(&env, vault_id, &vault);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-    }
-
-    /// Requests withdrawal approval from the beneficiary.
-    ///
-    /// Only the vault owner can call this function. If the amount exceeds the approval threshold,
-    /// the beneficiary must approve before the withdrawal can be executed.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    /// * `amount` - Amount to withdraw in stroops
-    /// * `caller` - The address of the caller (must be the vault owner)
-    ///
-    /// # Returns
-    /// Request ID for tracking the approval request
-    ///
-    /// # Panics
-    /// * Panics if the caller is not the vault owner
-    /// * Panics if the amount is invalid
-    pub fn request_withdrawal(env: Env, vault_id: u64, amount: i128, caller: Address) -> u64 {
-        caller.require_auth();
+    /// Delegates beneficiary role to another address.
+    /// Only the current beneficiary can call this.
+    pub fn delegate_beneficiary_role(env: Env, vault_id: u64, delegate_address: Address) {
+        Self::assert_not_paused(&env);
         let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            panic_with_error!(&env, ContractError::NotOwner);
+        vault.beneficiary.require_auth();
+
+        if delegate_address == vault.beneficiary {
+            panic_with_error!(&env, ContractError::InvalidBeneficiary);
         }
-        if amount <= 0 {
-            panic_with_error!(&env, ContractError::InvalidAmount);
-        }
 
-        let request_count_key = DataKey::WithdrawalRequestCount(vault_id);
-        let request_id = env.storage().persistent().get::<DataKey, u64>(&request_count_key).unwrap_or(0) + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryDelegate(vault_id), &delegate_address);
 
-        let request = WithdrawalRequest {
-            request_id,
-            amount,
-            requested_at: env.ledger().timestamp(),
-            approved: false,
-        };
-
-        env.storage().persistent().set(&DataKey::WithdrawalRequest(vault_id, request_id), &request);
-        env.storage().persistent().set(&request_count_key, &request_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().extend_ttl(&DataKey::WithdrawalRequest(vault_id, request_id), VAULT_TTL_THRESHOLD, ttl);
-        env.storage().persistent().extend_ttl(&request_count_key, VAULT_TTL_THRESHOLD, ttl);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-
-        request_id
+        env.events().publish(
+            (DELEGATE_BENEFICIARY_TOPIC,),
+            (vault_id, vault.beneficiary.clone(), delegate_address),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiaryDelegate(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
     }
 
-    /// Approves a withdrawal request.
-    ///
-    /// Only the vault beneficiary can call this function.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    /// * `request_id` - The ID of the withdrawal request to approve
-    /// * `caller` - The address of the caller (must be the vault beneficiary)
-    ///
-    /// # Panics
-    /// * Panics if the caller is not the vault beneficiary
-    /// * Panics if the request is not found
-    pub fn approve_withdrawal(env: Env, vault_id: u64, request_id: u64, caller: Address) {
-        caller.require_auth();
+    /// Gets the delegated beneficiary for a vault, if any.
+    pub fn get_delegated_beneficiary(env: Env, vault_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::BeneficiaryDelegate(vault_id))
+    }
+
+    // --- Issue #402: Withdrawal Scheduling ---
+
+    /// Sets a withdrawal schedule for the vault. Owner-only.
+    pub fn set_withdrawal_schedule(
+        env: Env,
+        vault_id: u64,
+        schedule: Vec<(u64, i128)>,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
         let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.beneficiary {
-            panic_with_error!(&env, ContractError::NotOwner);
+        vault.owner.require_auth();
+
+        let mut entries = Vec::new(&env);
+        for (timestamp, amount) in schedule.iter() {
+            if amount <= &0 {
+                return Err(ContractError::InvalidAmount);
+            }
+            entries.push_back(WithdrawalScheduleEntry {
+                timestamp,
+                amount,
+            });
         }
 
-        let key = DataKey::WithdrawalRequest(vault_id, request_id);
-        let mut request = env.storage().persistent().get::<DataKey, WithdrawalRequest>(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::VaultNotFound));
+        env.storage()
+            .persistent()
+            .set(&DataKey::WithdrawalSchedule(vault_id), &entries);
 
-        request.approved = true;
-        env.storage().persistent().set(&key, &request);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (WITHDRAWAL_SCHEDULED_TOPIC,),
+            (vault_id, entries.len()),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::WithdrawalSchedule(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
     }
 
-    /// Gets a withdrawal request.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    /// * `request_id` - The ID of the withdrawal request
-    ///
-    /// # Returns
-    /// `Some(request)` if found, `None` otherwise
-    pub fn get_withdrawal_request(env: Env, vault_id: u64, request_id: u64) -> Option<WithdrawalRequest> {
-        env.storage().persistent().get(&DataKey::WithdrawalRequest(vault_id, request_id))
-    }
-
-    // --- Issue #405: Deposit Proof ---
-
-    /// Verifies a deposit proof.
-    ///
-    /// Only the vault owner can call this function. This validates that funds actually exist
-    /// on the Stellar ledger before accepting a deposit.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    /// * `amount` - Amount to verify in stroops
-    /// * `proof_hash` - Hash of the proof data
-    /// * `caller` - The address of the caller (must be the vault owner)
-    ///
-    /// # Panics
-    /// * Panics if the caller is not the vault owner
-    pub fn verify_deposit_proof(env: Env, vault_id: u64, amount: i128, proof_hash: BytesN<32>, caller: Address) {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            panic_with_error!(&env, ContractError::NotOwner);
-        }
-        if amount <= 0 {
-            panic_with_error!(&env, ContractError::InvalidAmount);
-        }
-
-        let proof = DepositProof {
-            vault_id,
-            amount,
-            timestamp: env.ledger().timestamp(),
-            proof_hash,
-        };
-
-        env.storage().persistent().set(&DataKey::DepositProof(vault_id), &proof);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().extend_ttl(&DataKey::DepositProof(vault_id), VAULT_TTL_THRESHOLD, ttl);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-    }
-
-    /// Gets the deposit proof for a vault.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    ///
-    /// # Returns
-    /// `Some(proof)` if found, `None` otherwise
-    pub fn get_deposit_proof(env: Env, vault_id: u64) -> Option<DepositProof> {
-        env.storage().persistent().get(&DataKey::DepositProof(vault_id))
-    }
-
-    // --- Issue #406: Partial Withdrawal ---
-
-    /// Triggers a partial release of funds to the beneficiary.
-    ///
-    /// Only callable when the vault has expired. If an amount is specified, only that amount
-    /// is released; otherwise, all funds are released.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    /// * `amount` - Optional amount to release (None for all funds)
-    ///
-    /// # Panics
-    /// * Panics if the vault is not expired
-    /// * Panics if the vault is empty
-    /// * Panics if the amount exceeds the vault balance
-    pub fn trigger_partial_release(env: Env, vault_id: u64, amount: Option<i128>) {
+    /// Executes a scheduled withdrawal if conditions are met. Anyone can call.
+    pub fn execute_scheduled_withdrawal(env: Env, vault_id: u64) -> Result<(), ContractError> {
         Self::assert_not_paused(&env);
         let mut vault = Self::load_vault(&env, vault_id);
-        if vault.status != ReleaseStatus::Locked {
-            panic_with_error!(&env, ContractError::AlreadyReleased);
-        }
-        if !Self::is_expired(env.clone(), vault_id) {
-            panic_with_error!(&env, ContractError::NotExpired);
-        }
 
-        let release_amount = match amount {
-            Some(amt) => {
-                if amt <= 0 || amt > vault.balance {
-                    panic_with_error!(&env, ContractError::InvalidAmount);
+        let key = DataKey::WithdrawalSchedule(vault_id);
+        let mut schedule = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<WithdrawalScheduleEntry>>(&key)
+            .ok_or(ContractError::NoScheduledWithdrawals)?;
+
+        let now = env.ledger().timestamp();
+        let mut executed = false;
+
+        for i in 0..schedule.len() {
+            let entry = schedule.get(i).unwrap();
+            if entry.timestamp <= now && entry.amount > 0 {
+                if vault.balance < entry.amount {
+                    return Err(ContractError::InsufficientBalance);
                 }
-                amt
-            }
-            None => vault.balance,
-        };
 
-        if release_amount == 0 {
-            panic_with_error!(&env, ContractError::EmptyVault);
-        }
+                let token_client = token::Client::new(&env, &vault.token_address);
+                let beneficiary = Self::get_delegated_beneficiary(env.clone(), vault_id)
+                    .unwrap_or(vault.beneficiary.clone());
 
-        let token_client = token::Client::new(&env, &vault.token_address);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &beneficiary,
+                    &entry.amount,
+                );
 
-        if vault.beneficiaries.is_empty() {
-            token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &release_amount);
-            env.events().publish(
-                (RELEASE_TOPIC,),
-                ReleaseEvent { vault_id, beneficiary: vault.beneficiary.clone(), amount: release_amount },
-            );
-        } else {
-            let mut distributed: i128 = 0;
-            let last_idx = vault.beneficiaries.len() - 1;
-            for (i, entry) in vault.beneficiaries.iter().enumerate() {
-                let share = if i as u32 == last_idx {
-                    release_amount - distributed
-                } else {
-                    release_amount * (entry.bps as i128) / 10_000
-                };
-                if share > 0 {
-                    token_client.transfer(&env.current_contract_address(), &entry.address, &share);
-                }
-                distributed += share;
+                vault.balance -= entry.amount;
+                schedule.set(
+                    i,
+                    WithdrawalScheduleEntry {
+                        timestamp: entry.timestamp,
+                        amount: 0,
+                    },
+                );
+                executed = true;
+
                 env.events().publish(
-                    (RELEASE_TOPIC,),
-                    ReleaseEvent { vault_id, beneficiary: entry.address.clone(), amount: share },
+                    (WITHDRAWAL_EXECUTED_TOPIC,),
+                    (vault_id, entry.amount),
                 );
             }
         }
 
-        vault.balance -= release_amount;
-        if vault.balance == 0 {
-            vault.status = ReleaseStatus::Released;
+        if executed {
+            Self::save_vault(&env, vault_id, &vault);
+            env.storage()
+                .persistent()
+                .set(&DataKey::WithdrawalSchedule(vault_id), &schedule);
         }
-        Self::save_vault(&env, vault_id, &vault);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        if executed {
+            Ok(())
+        } else {
+            Err(ContractError::NoScheduledWithdrawals)
+        }
+    }
+
+    // --- Issue #400: Conditional Acceptance ---
+
+    /// Beneficiary accepts with conditions. Beneficiary-only.
+    pub fn accept_with_conditions(
+        env: Env,
+        vault_id: u64,
+        conditions: String,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.beneficiary.require_auth();
+
+        if conditions.len() == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let entry = ConditionalAcceptanceEntry {
+            conditions,
+            approved_by_owner: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ConditionalAcceptance(vault_id), &entry);
+
+        env.events().publish(
+            (CONDITIONS_ACCEPTED_TOPIC,),
+            (vault_id, vault.beneficiary.clone()),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::ConditionalAcceptance(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Owner approves conditional acceptance.
+    pub fn approve_conditional_acceptance(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        let key = DataKey::ConditionalAcceptance(vault_id);
+        let mut entry = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ConditionalAcceptanceEntry>(&key)
+            .ok_or(ContractError::InvalidBeneficiary)?;
+
+        entry.approved_by_owner = true;
+        env.storage().persistent().set(&key, &entry);
+        Ok(())
+    }
+
+    /// Gets conditional acceptance entry if it exists.
+    pub fn get_conditional_acceptance(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<ConditionalAcceptanceEntry> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, ConditionalAcceptanceEntry>(&DataKey::ConditionalAcceptance(vault_id))
+    }
+
+    // --- Issue #399: Dispute Resolution ---
+
+    /// Files a dispute. Beneficiary-only.
+    pub fn file_dispute(env: Env, vault_id: u64, reason: String) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.beneficiary.require_auth();
+
+        if reason.len() == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let current_status = env
+            .storage()
+            .persistent()
+            .get::<DataKey, DisputeStatus>(&DataKey::DisputeStatus(vault_id))
+            .unwrap_or(DisputeStatus::None);
+
+        if current_status == DisputeStatus::Filed {
+            return Err(ContractError::DisputeFiled);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeStatus(vault_id), &DisputeStatus::Filed);
+
+        env.events().publish(
+            (DISPUTE_FILED_TOPIC,),
+            (vault_id, vault.beneficiary.clone(), reason),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::DisputeStatus(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Resolves a dispute. Admin-only.
+    pub fn resolve_dispute(env: Env, vault_id: u64, resolution: String) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+
+        let current_status = env
+            .storage()
+            .persistent()
+            .get::<DataKey, DisputeStatus>(&DataKey::DisputeStatus(vault_id))
+            .unwrap_or(DisputeStatus::None);
+
+        if current_status != DisputeStatus::Filed {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeStatus(vault_id), &DisputeStatus::Resolved);
+
+        env.events().publish(
+            (DISPUTE_RESOLVED_TOPIC,),
+            (vault_id, resolution),
+        );
+        Ok(())
+    }
+
+    /// Gets the dispute status for a vault.
+    pub fn get_dispute_status(env: Env, vault_id: u64) -> DisputeStatus {
+        env.storage()
+            .persistent()
+            .get::<DataKey, DisputeStatus>(&DataKey::DisputeStatus(vault_id))
+            .unwrap_or(DisputeStatus::None)
     }
 }

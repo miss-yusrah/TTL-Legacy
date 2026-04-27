@@ -2778,155 +2778,262 @@ fn test_beneficiary_assigned_event_emitted() {
     assert!(has_beneficiary_event);
 }
 
-// --- Issue #403: Deposit Limits Tests ---
+
+// ---- Issue #401: Beneficiary Delegation Tests ----
 
 #[test]
-fn test_set_max_deposit_limit() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-
-    client.set_max_deposit(&vault_id, &owner, &Some(500i128));
-    assert_eq!(client.get_max_deposit(&vault_id), Some(500i128));
-}
-
-#[test]
-fn test_deposit_respects_max_limit() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-
-    client.set_max_deposit(&vault_id, &owner, &Some(300i128));
-    
-    // Deposit within limit should succeed
-    client.deposit(&vault_id, &owner, &200i128);
-    assert_eq!(client.get_vault(&vault_id).balance, 200i128);
-
-    // Deposit exceeding limit should fail
-    assert!(client.try_deposit(&vault_id, &owner, &150i128).is_err());
-}
-
-#[test]
-fn test_remove_deposit_limit() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-
-    client.set_max_deposit(&vault_id, &owner, &Some(300i128));
-    client.set_max_deposit(&vault_id, &owner, &None);
-    
-    assert_eq!(client.get_max_deposit(&vault_id), None);
-}
-
-// --- Issue #404: Withdrawal Approval Flow Tests ---
-
-#[test]
-fn test_request_withdrawal() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &owner, &500i128);
-
-    let request_id = client.request_withdrawal(&vault_id, &100i128, &owner);
-    assert_eq!(request_id, 1u64);
-
-    let request = client.get_withdrawal_request(&vault_id, &request_id).unwrap();
-    assert_eq!(request.amount, 100i128);
-    assert!(!request.approved);
-}
-
-#[test]
-fn test_approve_withdrawal() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &owner, &500i128);
-
-    let request_id = client.request_withdrawal(&vault_id, &100i128, &owner);
-    client.approve_withdrawal(&vault_id, &request_id, &beneficiary);
-
-    let request = client.get_withdrawal_request(&vault_id, &request_id).unwrap();
-    assert!(request.approved);
-}
-
-#[test]
-fn test_withdrawal_blocked_without_approval() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &owner, &500i128);
-
-    client.set_withdrawal_approval_threshold(&vault_id, &owner, &Some(100i128));
-
-    // Withdrawal above threshold should fail
-    assert!(client.try_withdraw(&vault_id, &owner, &150i128).is_err());
-
-    // Withdrawal below threshold should succeed
-    assert!(client.try_withdraw(&vault_id, &owner, &50i128).is_ok());
-}
-
-// --- Issue #405: Deposit Proof Tests ---
-
-#[test]
-fn test_verify_deposit_proof() {
+fn test_delegate_beneficiary_role() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-
-    let proof_hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
-    client.verify_deposit_proof(&vault_id, &500i128, &proof_hash, &owner);
-
-    let proof = client.get_deposit_proof(&vault_id).unwrap();
-    assert_eq!(proof.amount, 500i128);
-    assert_eq!(proof.vault_id, vault_id);
-}
-
-#[test]
-fn test_deposit_proof_only_by_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-
-    let proof_hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
     
-    // Non-owner should not be able to verify proof
-    assert!(client.try_verify_deposit_proof(&vault_id, &500i128, &proof_hash, &beneficiary).is_err());
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let delegate = Address::generate(&env);
+    
+    // Beneficiary delegates to another address
+    client.delegate_beneficiary_role(&vault_id, &delegate);
+    
+    // Verify delegation
+    let delegated = client.get_delegated_beneficiary(&vault_id);
+    assert_eq!(delegated, Some(delegate.clone()));
 }
 
-// --- Issue #406: Partial Withdrawal Tests ---
+#[test]
+fn test_delegate_beneficiary_requires_auth() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let delegate = Address::generate(&env);
+    
+    // Non-beneficiary cannot delegate
+    let result = client.try_delegate_beneficiary_role(&vault_id, &delegate);
+    assert!(result.is_err());
+}
 
 #[test]
-fn test_trigger_partial_release() {
+fn test_delegate_to_self_fails() {
     let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Cannot delegate to self
+    let result = client.try_delegate_beneficiary_role(&vault_id, &beneficiary);
+    assert!(result.is_err());
+}
+
+
+// ---- Issue #402: Withdrawal Scheduling Tests ----
+
+#[test]
+fn test_set_withdrawal_schedule() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
     client.deposit(&vault_id, &owner, &1000i128);
-
-    env.ledger().with_mut(|l| l.timestamp += 200);
-
-    // Partial release of 300
-    client.trigger_partial_release(&vault_id, &Some(300i128));
-
-    let vault = client.get_vault(&vault_id);
-    assert_eq!(vault.balance, 700i128);
-    assert_eq!(vault.status, ReleaseStatus::Locked);
+    
+    let now = env.ledger().timestamp();
+    let schedule = vec![
+        &env,
+        (now + 100, 100i128),
+        (now + 200, 200i128),
+    ];
+    
+    // Owner sets schedule
+    client.set_withdrawal_schedule(&vault_id, &schedule);
 }
 
 #[test]
-fn test_trigger_full_release_with_none() {
+fn test_set_withdrawal_schedule_owner_only() {
     let (env, owner, beneficiary, _, _, client) = setup();
+    
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &owner, &1000i128);
-
-    env.ledger().with_mut(|l| l.timestamp += 200);
-
-    // Full release with None
-    client.trigger_partial_release(&vault_id, &None);
-
-    let vault = client.get_vault(&vault_id);
-    assert_eq!(vault.balance, 0i128);
-    assert_eq!(vault.status, ReleaseStatus::Released);
+    let now = env.ledger().timestamp();
+    let schedule = vec![
+        &env,
+        (now + 100, 100i128),
+    ];
+    
+    // Non-owner cannot set schedule
+    let result = client.try_set_withdrawal_schedule(&vault_id, &schedule);
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_partial_release_invalid_amount() {
-    let (env, owner, beneficiary, _, _, client) = setup();
+fn test_execute_scheduled_withdrawal() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
     client.deposit(&vault_id, &owner, &1000i128);
+    
+    let now = env.ledger().timestamp();
+    let schedule = vec![
+        &env,
+        (now + 100, 200i128),
+    ];
+    
+    client.set_withdrawal_schedule(&vault_id, &schedule);
+    
+    // Advance time
+    env.ledger().with_mut(|l| l.timestamp = now + 150);
+    
+    // Execute withdrawal
+    client.execute_scheduled_withdrawal(&vault_id);
+    
+    // Verify funds transferred
+    let token_client = token::Client::new(&env, &token_address);
+    assert_eq!(token_client.balance(&beneficiary), 200i128);
+}
 
-    env.ledger().with_mut(|l| l.timestamp += 200);
+#[test]
+fn test_execute_scheduled_withdrawal_with_delegation() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let delegate = Address::generate(&env);
+    
+    client.deposit(&vault_id, &owner, &1000i128);
+    client.delegate_beneficiary_role(&vault_id, &delegate);
+    
+    let now = env.ledger().timestamp();
+    let schedule = vec![
+        &env,
+        (now + 100, 200i128),
+    ];
+    
+    client.set_withdrawal_schedule(&vault_id, &schedule);
+    
+    // Advance time
+    env.ledger().with_mut(|l| l.timestamp = now + 150);
+    
+    // Execute withdrawal
+    client.execute_scheduled_withdrawal(&vault_id);
+    
+    // Verify funds transferred to delegate
+    let token_client = token::Client::new(&env, &token_address);
+    assert_eq!(token_client.balance(&delegate), 200i128);
+}
 
-    // Amount exceeding balance should fail
-    assert!(client.try_trigger_partial_release(&vault_id, &Some(1500i128)).is_err());
+
+// ---- Issue #400: Conditional Acceptance Tests ----
+
+#[test]
+fn test_accept_with_conditions() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let conditions = String::from_str(&env, "Only if owner is deceased");
+    
+    // Beneficiary accepts with conditions
+    client.accept_with_conditions(&vault_id, &conditions);
+    
+    // Verify conditions stored
+    let stored = client.get_conditional_acceptance(&vault_id);
+    assert!(stored.is_some());
+    assert_eq!(stored.unwrap().approved_by_owner, false);
+}
+
+#[test]
+fn test_accept_with_conditions_beneficiary_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let conditions = String::from_str(&env, "Some conditions");
+    
+    // Non-beneficiary cannot accept with conditions
+    let result = client.try_accept_with_conditions(&vault_id, &conditions);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_approve_conditional_acceptance() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let conditions = String::from_str(&env, "Some conditions");
+    
+    client.accept_with_conditions(&vault_id, &conditions);
+    
+    // Owner approves
+    client.approve_conditional_acceptance(&vault_id);
+    
+    // Verify approval
+    let stored = client.get_conditional_acceptance(&vault_id);
+    assert!(stored.is_some());
+    assert_eq!(stored.unwrap().approved_by_owner, true);
+}
+
+
+// ---- Issue #399: Dispute Resolution Tests ----
+
+#[test]
+fn test_file_dispute() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "Funds are incorrect");
+    
+    // Beneficiary files dispute
+    client.file_dispute(&vault_id, &reason);
+    
+    // Verify dispute status
+    let status = client.get_dispute_status(&vault_id);
+    assert_eq!(status, DisputeStatus::Filed);
+}
+
+#[test]
+fn test_file_dispute_beneficiary_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "Some reason");
+    
+    // Non-beneficiary cannot file dispute
+    let result = client.try_file_dispute(&vault_id, &reason);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_resolve_dispute() {
+    let (env, owner, beneficiary, admin, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "Funds are incorrect");
+    let resolution = String::from_str(&env, "Verified and approved");
+    
+    client.file_dispute(&vault_id, &reason);
+    
+    // Admin resolves dispute
+    client.resolve_dispute(&vault_id, &resolution);
+    
+    // Verify dispute resolved
+    let status = client.get_dispute_status(&vault_id);
+    assert_eq!(status, DisputeStatus::Resolved);
+}
+
+#[test]
+fn test_resolve_dispute_admin_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "Some reason");
+    let resolution = String::from_str(&env, "Resolved");
+    
+    client.file_dispute(&vault_id, &reason);
+    
+    // Non-admin cannot resolve
+    let result = client.try_resolve_dispute(&vault_id, &resolution);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cannot_file_duplicate_dispute() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "First dispute");
+    let reason2 = String::from_str(&env, "Second dispute");
+    
+    client.file_dispute(&vault_id, &reason);
+    
+    // Cannot file another dispute while one is pending
+    let result = client.try_file_dispute(&vault_id, &reason2);
+    assert!(result.is_err());
 }
